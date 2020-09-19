@@ -19,12 +19,12 @@
 #include <pthread.h>
 
 #define MAX_STRING 100 //一个单词最长100个字符
-#define EXP_TABLE_SIZE 1000
-#define MAX_EXP 6
-#define MAX_SENTENCE_LENGTH 1000
-//一个句子最长1000个单词。text8中只有一行，所以连续的1000词当做一个句子来训练
-#define MAX_CODE_LENGTH 40
+#define EXP_TABLE_SIZE 1000  // 对sigmoid的运算结果进行缓存，存储1000个，需要用的时候查表
+#define MAX_EXP 6 // 最大计算到6 (exp^6 / (exp^6 + 1))，最小计算到-6 (exp^-6 / (exp^-6 + 1))
+#define MAX_SENTENCE_LENGTH 1000  //一个句子最长1000个单词。text8中只有一行，所以连续的1000词当做一个句子来训练
+#define MAX_CODE_LENGTH 40 //point域和code域大小 // 定义最长的霍夫曼编码长度
 
+// 哈希，线性探测，开放定址法，装填系数0.7
 const int vocab_hash_size = 30000000;  // Maximum 30 * 0.7 = 21M words in the vocabulary
 
 typedef float real;                    // Precision of float numbers
@@ -43,16 +43,47 @@ struct vocab_word *vocab;//词汇表
 int *vocab_hash;//先算出词汇的hash，vocab_hash[hash]就是word在vocab中的下标
 
 // 定义参数的默认值
+// binary 0则vectors.bin输出为二进制（默认），1则为文本形式
+// cbow 1使用cbow框架，0使用skip-gram框架
+// debug_mode 大于0，加载完毕后输出汇总信息，大于1，加载训练词汇的时候输出信息，训练过程中输出信息
+// window 窗口大小，在cbow中表示了word vector的最大的sum范围，在skip-gram中表示了max space between words（w1,w2,p(w1 | w2)）
+// min_count 设置最低频率,默认是5,如果一个词语在文档中出现的次数小于5,那么就会丢弃
+// num_threads 线程数
+// min_reduce ReduceVocab删除词频小于这个值的词，因为哈希表总共可以装填的词汇数是有限的
 int binary = 0, cbow = 1, debug_mode = 2, window = 5, min_count = 5, num_threads = 12, min_reduce = 1;
+
+// vocab_max_size 词汇表的最大长度，可以扩增，每次扩1000
+// vocab_size 词汇表的现有长度，接近vocab_max_size的时候会扩容
+// layer1_size 隐层的节点数
 long long vocab_max_size = 1000, vocab_size = 0, layer1_size = 100;
+
+// train_words 训练的单词总数（词频累加）
+// word_count_actual 已经训练完的word个数
+// file_size 训练文件大小，ftell得到
+// classes 输出word clusters的类别数(聚类的数目)
 long long train_words = 0, word_count_actual = 0, iter = 5, file_size = 0, classes = 0;
+
+// alpha BP算法的学习速率，过程中自动调整
+// starting_alpha 初始alpha值
+// sample 亚采样概率的参数，亚采样的目的是以一定概率拒绝高频词，使得低频词有更多出镜率，默认为0，即不进行亚采样
+//（采样的阈值，如果一个词语在训练样本中出现的频率越大,那么就越会被采样）
 real alpha = 0.025, starting_alpha, sample = 1e-3;
 
+// syn0 表示： 存储词典中每个词的词向量
+// syn1 表示： hs(hierarchical softmax)算法中霍夫曼编码树非叶结点的权重
+// syn1neg 表示： ns(negative sampling)负采样时，存储每个词对应的辅助向量（可以参考https://blog.csdn.net/itplus/article/details/37998797）
+// expTable 预先存储sigmod函数结果，算法执行中查表，提前计算好，提高效率
 real *syn0, *syn1, *syn1neg, *expTable;
+
+// start 算法运行的起始时间，会用于计算平均每秒钟处理多少词
 clock_t start;
 
+// hs 采用hs还是ns的标志位，默认采用ng
 int hs = 0, negative = 5;
+
 const int table_size = 1e8;
+
+// table 采样表
 int *table;
 
 
@@ -65,19 +96,21 @@ int *table;
 void InitUnigramTable() {
   int a, i;
   long long train_words_pow = 0;//归一化项
-  real d1, power = 0.75;
+  real d1, power = 0.75; // 概率与词频的power次方成正比
   table = (int *)malloc(table_size * sizeof(int));
   for (a = 0; a < vocab_size; a++)
-    train_words_pow += pow(vocab[a].cn, power);
+    train_words_pow += pow(vocab[a].cn, power);  //遍历词汇表，统计词的能量总值train_words_pow
+
   i = 0;
-  d1 = pow(vocab[i].cn, power) / (real)train_words_pow;
+  d1 = pow(vocab[i].cn, power) / (real)train_words_pow;  //表示已遍历词的能量值占总能量的比
+
   for (a = 0; a < table_size; a++) {
-    table[a] = i;
+    table[a] = i; //单词i占用table的a位置  //table反映的是一个单词能量的分布，一个单词能量越大，所占用的table的位置越多
     if (a / (real)table_size > d1) {
       i++;
       d1 += pow(vocab[i].cn, power) / (real)train_words_pow;
     }
-    if (i >= vocab_size) i = vocab_size - 1;
+    if (i >= vocab_size) i = vocab_size - 1; // 处理最后一段概率，所有落在最后一个概率区间的，都选中最后一个词
   }
 }
 
@@ -86,13 +119,11 @@ void InitUnigramTable() {
 void ReadWord(char *word, FILE *fin) {
   int a = 0, ch;
   // 不到文件结尾
-  while (!feof(fin))
-  {
+  while (!feof(fin)) {
     ch = fgetc(fin);
     // 回车键
     if (ch == 13) continue;
-    if ((ch == ' ') || (ch == '\t') || (ch == '\n'))
-    {
+    if ((ch == ' ') || (ch == '\t') || (ch == '\n')) {
       if (a > 0) {
         // 用换行符表示一个句子的开始符号，所以读入换行符后，还需要重新写回
         if (ch == '\n') ungetc(ch, fin);
@@ -191,6 +222,8 @@ void SortVocab() {
     }
   }
 
+  //重新指定vocab的内存大小，realloc 可重新指定vocab的内存大小，可大可小
+  //分配的多余空间收回
   vocab = (struct vocab_word *)realloc(vocab, (vocab_size + 1) * sizeof(struct vocab_word));
   // Allocate memory for the binary tree construction
   for (a = 0; a < vocab_size; a++) {
@@ -383,71 +416,138 @@ void ReadVocab() {
   fclose(fin);
 }
 
+//3.网络模型初始化
+//3.1.词向量的初始化：syn0
+//3.2.映射层到输出层权重初始化：hs（syn1）、negtive（syn1neg）
+//3.3.创建huffman树：CreateBinaryTree
 void InitNet() {
   long long a, b;
+
+  // layer1_size will the the dimension of feature space
+  // syn0 and syn1/syn1neg are of size vocab_size * layer1_size
+  // syn0-词向量
   unsigned long long next_random = 1;
+
   // 分配词向量空间
+  // posix_memalign() 成功时会返回size字节的动态内存，并且这块内存的地址是alignment(这里是128)的倍数
+  // syn0 存储的是word vectors
+  // 这里为syn0分配内存空间
+  // 调用posiz_memalign来获取一块数量为vocab_size * layer1_size，128byte页对齐的内存
+  // 其中layer1_size是词向量的长度
   a = posix_memalign((void **)&syn0, 128, (long long)vocab_size * layer1_size * sizeof(real));
   if (syn0 == NULL) {printf("Memory allocation failed\n"); exit(1);}
 
-  // 随机初始化syn0，即为词向量
-  for (a = 0; a < vocab_size; a++) for (b = 0; b < layer1_size; b++) {
-      next_random = next_random * (unsigned long long)25214903917 + 11;
-      syn0[a * layer1_size + b] = (((next_random & 0xFFFF) / (real)65536) - 0.5) / layer1_size;
-    }
   // 层次化softmax算法
+  //3.2.映射层到输出层权重初始化：hs（syn1）
   if (hs) {
     // syn1表示哈夫曼树的内部节点向量表示
     a = posix_memalign((void **)&syn1, 128, (long long)vocab_size * layer1_size * sizeof(real));
     if (syn1 == NULL) {printf("Memory allocation failed\n"); exit(1);}
     // 初始化syn1为全0
-    for (a = 0; a < vocab_size; a++) for (b = 0; b < layer1_size; b++)
+    for (a = 0; a < vocab_size; a++)
+      for (b = 0; b < layer1_size; b++)
         syn1[a * layer1_size + b] = 0;
   }
+
   // 负采样算法
+  // 如果要使用负采样，则需要为syn1neg分配内存空间
+  // syn1neg是负采样时每个词的辅助向量
+  // 3.2.映射层到输出层权重初始化：negtive（syn1neg）
   if (negative > 0) {
     // syn1neg表示哈夫曼树的内部节点向量表示
     a = posix_memalign((void **)&syn1neg, 128, (long long)vocab_size * layer1_size * sizeof(real));
     if (syn1neg == NULL) {printf("Memory allocation failed\n"); exit(1);}
+
     // 初始化syn1neg为全0
-    for (a = 0; a < vocab_size; a++) for (b = 0; b < layer1_size; b++)
+    for (a = 0; a < vocab_size; a++)
+      for (b = 0; b < layer1_size; b++)
         syn1neg[a * layer1_size + b] = 0;
+  }
+
+  // 3.1.词向量的初始化：首先，生成一个很大的next_random的数，
+  // 通过与“0xFFFF”进行与运算截断，再除以65536得到[0,1]之间的数，
+  // 最终，得到的初始化的向量的范围为：[-0.5/layer1_size,0.5/layer1_size],其中layer1_size为词向量的长度
+  for (a = 0; a < vocab_size; a++)
+    for (b = 0; b < layer1_size; b++) {
+    next_random = next_random * (unsigned long long)25214903917 + 11;
+    syn0[a * layer1_size + b] = (((next_random & 0xFFFF) / (real)65536) - 0.5) / layer1_size;
   }
   // 负采样算法也需要构建哈夫曼树吗？
   CreateBinaryTree();
 }
 
 void *TrainModelThread(void *id) {
+
+  // word: 在提取句子时用来表示当前词在词表中的索引，也就是说向sen中添加单词用，句子完成后表示句子中的当前单词
+  // last_word 上一个单词，辅助扫描窗口，记录当前扫描到的上下文单词
+  // sentence_length 当前处理的句子长度，当前句子的长度（单词数）
+  // sentence_position 当前处理的单词在当前句子中的位置（index）
+  // cw：窗口长度（中心词除外）
   long long a, b, d, cw, word, last_word, sentence_length = 0, sentence_position = 0;
+
+  // word_count: 当前线程当前时刻已训练的语料的长度
+  // last_word_count: 当前线程上一次记录时已训练的语料长度
+  // last_word_count：保存值，以便在新训练语料长度超过某个值时输出信息
+  // sen 单词数组，表示句子，//sen：当前从文件中读取的待处理句子，存放的是每个词在词表中的索引
   long long word_count = 0, last_word_count = 0, sen[MAX_SENTENCE_LENGTH + 1];
+
+  // l1：在skip-gram模型中，在syn0中定位当前词词向量的起始位置
+  // l2：在syn1或syn1neg中定位中间节点向量或负采样向量的起始位置
+  // l1 ns中表示word在concatenated word vectors中的起始位置，之后layer1_size是对应的word vector，因为把矩阵拉成长向量了 说的不太懂，不如上面的清晰
+  // l2 cbow或ns中权重向量的起始位置，之后layer1_size是对应的syn1或syn1neg，因为把矩阵拉成长向量了
+  // c 循环中的计数作用
+  // target：在负采样中存储当前样本
+  // label：在负采样中存储当前样本的标记
   long long l1, l2, c, target, label, local_iter = iter;
+
+  // id 线程创建的时候传入，辅助随机数生成
   unsigned long long next_random = (long long)id;
+
+  // f e^x / (1/e^x)，fs中指当前编码为是0（父亲的左子节点为0，右为1）的概率，ns中指label是1的概率
+  // g 误差(f与真实值的偏离)与学习速率的乘积
   real f, g;
+
+  // 当前时间，和start比较计算算法效率
   clock_t now;
 
-  // 这两个数据结构干嘛的？
-  real *neu1 = (real *)calloc(layer1_size, sizeof(real));
-  real *neu1e = (real *)calloc(layer1_size, sizeof(real));
+  //neu1：输入词向量，在CBOW模型中是Context(x)中各个词的向量和，在skip-gram模型中是中心词的词向量
+  real *neu1 = (real *)calloc(layer1_size, sizeof(real)); // 隐层节点
+  real *neu1e = (real *)calloc(layer1_size, sizeof(real));  // 误差累计项，其实对应的是Gneu1
 
+  // 4.1.多线程模型训练：利用多线程对训练文件划分，每个线程训练一部分的数据
+  // 每个进程对应一段文本，根据当前线程的id找到该线程对应文本的初始位置
+  // file_size就是之前LearnVocabFromTrainFile和ReadVocab函数中获取的训练文件的大小
   FILE *fi = fopen(train_file, "rb");
-  // 为每个线程分割训练数据，设定文件头初始位置
+
+
+  // 4.1.多线程模型训练：利用多线程对训练文件划分，每个线程训练一部分的数据
+  // 每个进程对应一段文本，根据当前线程的id找到该线程对应文本的初始位置
+  // file_size就是之前LearnVocabFromTrainFile和ReadVocab函数中获取的训练文件的大小
   fseek(fi, file_size / (long long)num_threads * (long long)id, SEEK_SET);
 
+  //4.2 对每一个词，应用四种模型进行训练。
   while (1) {
-
+    //每训练约10000词输出一次训练进度
     if (word_count - last_word_count > 10000) {
+      //word_count_actual是所有线程总共当前处理的词数
       word_count_actual += word_count - last_word_count;
       last_word_count = word_count;
 
       // 输出debug信息
       if ((debug_mode > 1)) {
         now = clock();
+
+        //输出信息包括：
+	//当前的学习率alpha；
+	//训练总进度（当前训练的总词数/(迭代次数*训练样本总词数)+1）；
+	//每个线程每秒处理的词数
         printf("%cAlpha: %f  Progress: %.2f%%  Words/thread/sec: %.2fk  ", 13, alpha,
                word_count_actual / (real)(iter * train_words + 1) * 100,
                word_count_actual / ((real)(now - start + 1) / (real)CLOCKS_PER_SEC * 1000));
         fflush(stdout);
       }
-      // 学习率逐渐减小
+
+      //在初始学习率的基础上，随着实际训练词数的上升，逐步降低当前学习率（自适应调整学习率）
       alpha = starting_alpha * (1 - word_count_actual / (real)(iter * train_words + 1));
       // 防止学习率过小，不小于初始学习率的万分之一
       if (alpha < starting_alpha * 0.0001) alpha = starting_alpha * 0.0001;
@@ -456,14 +556,18 @@ void *TrainModelThread(void *id) {
     //读入训练语料中的一个句子：或者读入文件中的一行，或者读入某行中连续的1000词，下次接着读入
     if (sentence_length == 0) {
       while (1) {
-        word = ReadWordIndex(fi);
-        if (feof(fi)) break;
+        word = ReadWordIndex(fi); //从文件中读入一个词，将该词在词汇表中的索引赋给word
+        if (feof(fi)) break; // 读到文件末尾
         if (word == -1) continue;
         word_count++;
         if (word == 0) break;//读到句子开始符号
+
         // The subsampling randomly discards frequent words while keeping the ranking same
-        //
-        if (sample > 0) {//以一定的概率丢弃词语
+        // 这里的亚采样是指 Sub-Sampling，Mikolov 在论文指出这种亚采样能够带来 2 到 10 倍的性能提升，并能够提升低频词的表示精度。
+        // 低频词被丢弃概率低，高频词被丢弃概率高
+	// 对高频词进行随机下采样，丢弃掉一些高频词，能够使低频词向量更加准确，同时加快训练速度
+	// 可以看作是一种平滑方法
+        if (sample > 0) {
           real ran = (sqrt(vocab[word].cn / (sample * train_words)) + 1) * (sample * train_words) / vocab[word].cn;
           next_random = next_random * (unsigned long long)25214903917 + 11;
           if (ran < (next_random & 0xFFFF) / (real)65536) continue;
@@ -857,5 +961,3 @@ int main(int argc, char **argv) {
   TrainModel();
   return 0;
 }
-
-
