@@ -525,11 +525,11 @@ void *TrainModelThread(void *id) {
   // file_size就是之前LearnVocabFromTrainFile和ReadVocab函数中获取的训练文件的大小
   fseek(fi, file_size / (long long)num_threads * (long long)id, SEEK_SET);
 
-  //4.2 对每一个词，应用四种模型进行训练。
+  // 4.2 对每一个词，应用四种模型进行训练。
   while (1) {
-    //每训练约10000词输出一次训练进度
+    // 每训练约10000词输出一次训练进度
     if (word_count - last_word_count > 10000) {
-      //word_count_actual是所有线程总共当前处理的词数
+      // word_count_actual是所有线程总共当前处理的词数
       word_count_actual += word_count - last_word_count;
       last_word_count = word_count;
 
@@ -537,30 +537,31 @@ void *TrainModelThread(void *id) {
       if ((debug_mode > 1)) {
         now = clock();
 
-        //输出信息包括：
-	//当前的学习率alpha；
-	//训练总进度（当前训练的总词数/(迭代次数*训练样本总词数)+1）；
-	//每个线程每秒处理的词数
+        // 输出信息包括：
+	// 当前的学习率alpha；
+	// 训练总进度（当前训练的总词数/(迭代次数*训练样本总词数)+1）；
+	// 每个线程每秒处理的词数
         printf("%cAlpha: %f  Progress: %.2f%%  Words/thread/sec: %.2fk  ", 13, alpha,
                word_count_actual / (real)(iter * train_words + 1) * 100,
                word_count_actual / ((real)(now - start + 1) / (real)CLOCKS_PER_SEC * 1000));
         fflush(stdout);
       }
 
-      //在初始学习率的基础上，随着实际训练词数的上升，逐步降低当前学习率（自适应调整学习率）
+      // 在初始学习率的基础上，随着实际训练词数的上升，逐步降低当前学习率（自适应调整学习率）
       alpha = starting_alpha * (1 - word_count_actual / (real)(iter * train_words + 1));
+
       // 防止学习率过小，不小于初始学习率的万分之一
       if (alpha < starting_alpha * 0.0001) alpha = starting_alpha * 0.0001;
     }
 
-    //读入训练语料中的一个句子：或者读入文件中的一行，或者读入某行中连续的1000词，下次接着读入
+    // 读入训练语料中的一个句子：或者读入文件中的一行，或者读入某行中连续的1000词，下次接着读入
     if (sentence_length == 0) {
       while (1) {
-        word = ReadWordIndex(fi); //从文件中读入一个词，将该词在词汇表中的索引赋给word
+        word = ReadWordIndex(fi); // 从文件中读入一个词，将该词在词汇表中的索引赋给word
         if (feof(fi)) break; // 读到文件末尾
         if (word == -1) continue;
         word_count++;
-        if (word == 0) break;//读到句子开始符号
+        if (word == 0) break;// 读到句子开始符号
 
         // The subsampling randomly discards frequent words while keeping the ranking same
         // 这里的亚采样是指 Sub-Sampling，Mikolov 在论文指出这种亚采样能够带来 2 到 10 倍的性能提升，并能够提升低频词的表示精度。
@@ -593,18 +594,27 @@ void *TrainModelThread(void *id) {
       continue;
     }
 
-    word = sen[sentence_position];//一个句子中第sentence_position（0）个词在词表中的下标
+    word = sen[sentence_position];// 一个句子中第sentence_position（0）个词在词表中的下标
     if (word == -1) continue;
     // 初始化neu1和neu1e，用于hs和negative sampling
-    for (c = 0; c < layer1_size; c++) neu1[c] = 0;//只用于cbow
-    for (c = 0; c < layer1_size; c++) neu1e[c] = 0;//同时用于cbow和hs
+    for (c = 0; c < layer1_size; c++)
+      neu1[c] = 0; // 只用于cbow
+    for (c = 0; c < layer1_size; c++)
+      neu1e[c] = 0; // 同时用于cbow和hs
+
     next_random = next_random * (unsigned long long)25214903917 + 11;
-    b = next_random % window;//b是将window随机缩小为b
+
+    //生成一个[0, window-1]的随机数，用来确定|context(w)|窗口的实际宽度（提高训练速率？）
+    b = next_random % window;// b是将window随机缩小为b
 
     // 开始执行训练算法
-    if (cbow) {  //train the cbow architecture
+    if (cbow) {  // train the cbow architecture
       // in -> hidden
       cw = 0;
+
+      // 一个词的窗口为[setence_position - window + b, sentence_position + window - b]
+      // 因此窗口总长度为 2*window - 2*b + 1
+      // 将窗口内的word vectors累加到隐层节点上
       for (a = b; a < window * 2 + 1 - b; a++)
         if (a != window) {
           c = sentence_position - window + a;
@@ -673,15 +683,16 @@ void *TrainModelThread(void *id) {
     else {  //train skip-gram
       for (a = b; a < window * 2 + 1 - b; a++)
         if (a != window) {//此时就是j=0的情况
-          c = sentence_position - window + a;//c表示要预测的单词在句子中的下标
-          if (c < 0) continue;//句首的单词前面没有window那么多单词
+          c = sentence_position - window + a;// c表示要预测的单词在句子中的下标
+          if (c < 0) continue;// 句首的单词前面没有window那么多单词
           if (c >= sentence_length) continue;
-          last_word = sen[c];//要预测的单词的下标
+          last_word = sen[c];// 要预测的单词的下标
           if (last_word == -1) continue;
           // 要预测的词向量在syn0数组中的偏移
           l1 = last_word * layer1_size;
           // 对于窗口内的每个要预测的词，都需要初始化neu1e为0.代表反向传播的错误信息
-          for (c = 0; c < layer1_size; c++) neu1e[c] = 0;
+          for (c = 0; c < layer1_size; c++)
+            neu1e[c] = 0;
 
           // skip-gram中使用HIERARCHICAL SOFTMAX
           if (hs)
@@ -720,17 +731,30 @@ void *TrainModelThread(void *id) {
                 if (target == word) continue;
                 label = 0;
               }
+
+              // 此时的l2为syn1neg中目标单词向量的起始位置
               l2 = target * layer1_size;
               f = 0;
-              for (c = 0; c < layer1_size; c++) f += syn0[c + l1] * syn1neg[c + l2];
-              if (f > MAX_EXP) g = (label - 1) * alpha;
-              else if (f < -MAX_EXP) g = (label - 0) * alpha;
-              else g = (label - expTable[(int)((f + MAX_EXP) * (EXP_TABLE_SIZE / MAX_EXP / 2))]) * alpha;
-              for (c = 0; c < layer1_size; c++) neu1e[c] += g * syn1neg[c + l2];
-              for (c = 0; c < layer1_size; c++) syn1neg[c + l2] += g * syn0[c + l1];
+
+              for (c = 0; c < layer1_size; c++)
+                f += syn0[c + l1] * syn1neg[c + l2];
+
+              if (f > MAX_EXP)
+                g = (label - 1) * alpha;
+              else if (f < -MAX_EXP)
+                g = (label - 0) * alpha;
+              else
+                g = (label - expTable[(int)((f + MAX_EXP) * (EXP_TABLE_SIZE / MAX_EXP / 2))]) * alpha;
+
+              for (c = 0; c < layer1_size; c++)
+                neu1e[c] += g * syn1neg[c + l2];
+
+              for (c = 0; c < layer1_size; c++)
+                syn1neg[c + l2] += g * syn0[c + l1];
             }
           // Learn weights input -> hidden
-          for (c = 0; c < layer1_size; c++) syn0[c + l1] += neu1e[c];
+          for (c = 0; c < layer1_size; c++)
+            syn0[c + l1] += neu1e[c];
         }
     }//结束skip-gram
 
